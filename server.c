@@ -9,6 +9,7 @@
 
 #define PORT 8080
 #define BUFFER_SIZE 1024
+#define CHUNK 16384
 
 void *handle_client(void *client_socket);
 int compress_file(const char *source, const char *destination, int level);
@@ -110,19 +111,42 @@ int compress_file(const char *source, const char *destination, int level) {
         return -1;
     }
 
-    unsigned char buffer[BUFFER_SIZE];
+    fseek(src, 0, SEEK_END);
+    size_t total_size = ftell(src);
+    fseek(src, 0, SEEK_SET);
+
+    unsigned char buffer[CHUNK];
     int num_read = 0;
-    while ((num_read = fread(buffer, 1, BUFFER_SIZE, src)) > 0) {
+    size_t total_read = 0;
+
+    while ((num_read = fread(buffer, 1, CHUNK, src)) > 0) {
         if (gzwrite(dst, buffer, num_read) != num_read) {
             perror("Failed to write to gzip file");
             fclose(src);
             gzclose(dst);
             return -1;
         }
+        total_read += num_read;
+        print_progress(total_read, total_size);
     }
 
     fclose(src);
     gzclose(dst);
 
     return 0;
+}
+
+void print_progress(size_t current, size_t total) {
+    int bar_width = 70;
+    float progress = (float)current / total;
+    int pos = bar_width * progress;
+
+    printf("[");
+    for (int i = 0; i < bar_width; ++i) {
+        if (i < pos) printf("=");
+        else if (i == pos) printf(">");
+        else printf(" ");
+    }
+    printf("] %d%%\r", (int)(progress * 100.0));
+    fflush(stdout);
 }
