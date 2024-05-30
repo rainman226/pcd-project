@@ -5,18 +5,18 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <pthread.h>
-#include <zlib.h>
+#include <minizip/zip.h>
 #include <dirent.h>
 #include <sys/stat.h>
-#include <fcntl.h>
-#include <libtar.h>
+#include <time.h>
 
 #define PORT 8080
-#define BUFFER_SIZE 4096  // Increased buffer size to avoid truncation warnings
+#define BUFFER_SIZE 4096
 
 void *handle_client(void *client_socket);
-int create_tar(const char *source_dir, const char *tar_path);
-int compress_file(const char *source, const char *destination, int level);
+int add_file_to_zip(zipFile zf, const char *filepath, const char *password, int compression_level);
+int create_zip(const char *source_dir, const char *zip_path, const char *password, int compression_level);
+uLong tm_to_dosdate(const struct tm *ptm);
 
 int main() {
     int server_fd, new_socket;
@@ -76,40 +76,30 @@ void *handle_client(void *client_socket) {
     char source_dir[BUFFER_SIZE];
     char destination[BUFFER_SIZE];
     int compression_level;
+    char password[BUFFER_SIZE];
 
-    // Read the source directory path, destination file path, and compression level from client
+    // Read the source directory path, destination file path, compression level, and password from client
     read(sock, buffer, BUFFER_SIZE);
-    sscanf(buffer, "%s %s %d", source_dir, destination, &compression_level);
+    sscanf(buffer, "%s %s %d %[^\n]", source_dir, destination, &compression_level, password);
 
+    printf("Password: %s\n", password);
     printf("Compressing directory: %s\n", source_dir);
 
-    // Create a tarball of the directory
-    char tar_path[BUFFER_SIZE];
-    snprintf(tar_path, BUFFER_SIZE, "%s.tar", destination);
-    if (create_tar(source_dir, tar_path) != 0) {
-        send(sock, "Directory compression failed", strlen("Directory compression failed"), 0);
-        close(sock);
-        pthread_exit(NULL);
-    }
-
-    // Compress the tarball with gzip
-    if (compress_file(tar_path, destination, compression_level) != 0) {
+    // Create a ZIP archive of the directory
+    if (create_zip(source_dir, destination, password, compression_level) != 0) {
         send(sock, "Directory compression failed", strlen("Directory compression failed"), 0);
     } else {
         send(sock, "Directory compressed successfully", strlen("Directory compressed successfully"), 0);
     }
 
-    // Remove the tarball after compression
-    remove(tar_path);
-
     close(sock);
     pthread_exit(NULL);
 }
 
-int create_tar(const char *source_dir, const char *tar_path) {
-    TAR *pTar;
-    if (tar_open(&pTar, tar_path, NULL, O_WRONLY | O_CREAT, 0644, TAR_GNU) == -1) {
-        perror("tar_open");
+int create_zip(const char *source_dir, const char *zip_path, const char *password, int compression_level) {
+    zipFile zf = zipOpen(zip_path, APPEND_STATUS_CREATE);
+    if (zf == NULL) {
+        perror("zipOpen");
         return -1;
     }
 
@@ -125,65 +115,78 @@ int create_tar(const char *source_dir, const char *tar_path) {
     while ((entry = readdir(dir)) != NULL) {
         if (entry->d_type == DT_REG) {  // Only process regular files
             snprintf(filepath, BUFFER_SIZE, "%s/%s", source_dir, entry->d_name);
-            if (tar_append_file(pTar, filepath, entry->d_name) != 0) {
-                perror("tar_append_file");
+            printf("Adding file: %s with password: %s\n", filepath, password);
+            if (add_file_to_zip(zf, filepath, password, compression_level) != 0) {
                 closedir(dir);
-                tar_close(pTar);
+                zipClose(zf, NULL);
                 return -1;
             }
         }
     }
 
     closedir(dir);
-
-    if (tar_append_eof(pTar) != 0) {
-        perror("tar_append_eof");
-        tar_close(pTar);
-        return -1;
-    }
-
-    if (tar_close(pTar) != 0) {
-        perror("tar_close");
-        return -1;
-    }
-
+    zipClose(zf, NULL);
     return 0;
 }
 
-int compress_file(const char *source, const char *destination, int level) {
-    FILE *src = fopen(source, "rb");
-    if (!src) {
-        perror("Source file open error");
+int add_file_to_zip(zipFile zf, const char *filepath, const char *password, int compression_level) {
+    FILE *file = fopen(filepath, "rb");
+    if (!file) {
+        perror("fopen");
         return -1;
     }
 
-    gzFile dst = gzopen(destination, "wb");
-    if (!dst) {
-        perror("Destination file open error");
-        fclose(src);
-        return -1;
+    zip_fileinfo zi;
+    memset(&zi, 0, sizeof(zi));
+
+    // Get file modification time
+    struct stat st;
+    if (stat(filepath, &st) == 0) {
+        struct tm *filedate = localtime(&st.st_mtime);
+        zi.dosDate = tm_to_dosdate(filedate);
     }
 
-    if (gzsetparams(dst, level, Z_DEFAULT_STRATEGY) != Z_OK) {
-        perror("Failed to set gzip parameters");
-        fclose(src);
-        gzclose(dst);
+    const char *filename_in_zip = strrchr(filepath, '/');
+    if (filename_in_zip == NULL) {
+        filename_in_zip = filepath;
+    } else {
+        filename_in_zip++;
+    }
+
+    int err = zipOpenNewFileInZip3(
+        zf, filename_in_zip, &zi, NULL, 0, NULL, 0, NULL,
+        Z_DEFLATED, compression_level, 0,
+        -MAX_WBITS, DEF_MEM_LEVEL, Z_DEFAULT_STRATEGY,
+        (password && strlen(password) > 0) ? password : NULL, 0);
+    if (err != ZIP_OK) {
+        fclose(file);
+        fprintf(stderr, "zipOpenNewFileInZip3 error: %d\n", err);
         return -1;
     }
 
     unsigned char buffer[BUFFER_SIZE];
-    int num_read;
-    while ((num_read = fread(buffer, 1, BUFFER_SIZE, src)) > 0) {
-        if (gzwrite(dst, buffer, num_read) != num_read) {
-            perror("Failed to write to gzip file");
-            fclose(src);
-            gzclose(dst);
+    size_t bytes_read;
+    while ((bytes_read = fread(buffer, 1, BUFFER_SIZE, file)) > 0) {
+        err = zipWriteInFileInZip(zf, buffer, bytes_read);
+        if (err < 0) {
+            fclose(file);
+            fprintf(stderr, "zipWriteInFileInZip error: %d\n", err);
             return -1;
         }
     }
 
-    fclose(src);
-    gzclose(dst);
-
+    fclose(file);
+    zipCloseFileInZip(zf);
     return 0;
+}
+
+uLong tm_to_dosdate(const struct tm *ptm) {
+    uLong year = (uLong)ptm->tm_year + 1900;
+    if (year < 1980) {
+        year = 1980;
+    } else if (year > 2107) {
+        year = 2107;
+    }
+    return (uLong)(((year - 1980) << 25) | ((ptm->tm_mon + 1) << 21) | (ptm->tm_mday << 16) |
+                   (ptm->tm_hour << 11) | (ptm->tm_min << 5) | (ptm->tm_sec >> 1));
 }
