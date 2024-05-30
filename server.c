@@ -30,16 +30,16 @@ pthread_mutex_t compressions_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 void *handle_client(void *client_socket);
 void *handle_admin_client(void *client_socket);
+void *client_listener(void *arg);
+void *admin_listener(void *arg);
 int add_file_to_zip(zipFile zf, const char *filepath, const char *password, int compression_level, compression_info_t *info);
 int create_zip(const char *source_dir, const char *zip_path, const char *password, int compression_level, compression_info_t *info);
 uLong tm_to_dosdate(const struct tm *ptm);
 void print_progress(size_t current, size_t total);
 
 int main() {
-    int server_fd, admin_fd, new_socket;
-    struct sockaddr_in address;
-    int addrlen = sizeof(address);
-    pthread_t thread_id, admin_thread_id;
+    int server_fd, admin_fd;
+    pthread_t client_thread, admin_thread;
 
     memset(compressions, 0, sizeof(compressions));
 
@@ -56,20 +56,26 @@ int main() {
     }
 
     // Bind the client socket to the network
-    address.sin_family = AF_INET;
-    address.sin_addr.s_addr = INADDR_ANY;
-    address.sin_port = htons(PORT);
+    struct sockaddr_in client_address = {
+        .sin_family = AF_INET,
+        .sin_addr.s_addr = INADDR_ANY,
+        .sin_port = htons(PORT)
+    };
 
-    if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
+    if (bind(server_fd, (struct sockaddr *)&client_address, sizeof(client_address)) < 0) {
         perror("Client bind failed");
         close(server_fd);
         exit(EXIT_FAILURE);
     }
 
     // Bind the admin socket to the network
-    address.sin_port = htons(ADMIN_PORT);
+    struct sockaddr_in admin_address = {
+        .sin_family = AF_INET,
+        .sin_addr.s_addr = INADDR_ANY,
+        .sin_port = htons(ADMIN_PORT)
+    };
 
-    if (bind(admin_fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
+    if (bind(admin_fd, (struct sockaddr *)&admin_address, sizeof(admin_address)) < 0) {
         perror("Admin bind failed");
         close(admin_fd);
         exit(EXIT_FAILURE);
@@ -91,42 +97,30 @@ int main() {
 
     printf("Server is listening on port %d for clients and port %d for admins\n", PORT, ADMIN_PORT);
 
-    // Handling client connections in a separate thread
-    pthread_create(&thread_id, NULL, (void *(*)(void *))handle_client_connections, (void *)&server_fd);
+    // Create threads to handle client and admin connections
+    pthread_create(&client_thread, NULL, client_listener, &server_fd);
+    pthread_create(&admin_thread, NULL, admin_listener, &admin_fd);
 
-    // Handling admin connections
-    while (1) {
-        if ((new_socket = accept(admin_fd, (struct sockaddr *)&address, (socklen_t*)&addrlen)) < 0) {
-            perror("Admin accept failed");
-            close(admin_fd);
-            exit(EXIT_FAILURE);
-        }
-
-        printf("Accepted new admin connection\n");
-
-        // Create a new thread for each admin client
-        if (pthread_create(&admin_thread_id, NULL, handle_admin_client, (void *)&new_socket) != 0) {
-            perror("Failed to create admin thread");
-            close(new_socket);
-        }
-    }
+    // Wait for the threads to finish (they won't in this case)
+    pthread_join(client_thread, NULL);
+    pthread_join(admin_thread, NULL);
 
     close(server_fd);
     close(admin_fd);
     return 0;
 }
 
-void handle_client_connections(int *server_fd) {
+void *client_listener(void *arg) {
+    int server_fd = *(int *)arg;
     int new_socket;
     struct sockaddr_in address;
     int addrlen = sizeof(address);
     pthread_t thread_id;
 
     while (1) {
-        if ((new_socket = accept(*server_fd, (struct sockaddr *)&address, (socklen_t*)&addrlen)) < 0) {
+        if ((new_socket = accept(server_fd, (struct sockaddr *)&address, (socklen_t*)&addrlen)) < 0) {
             perror("Client accept failed");
-            close(*server_fd);
-            exit(EXIT_FAILURE);
+            continue;
         }
 
         printf("Accepted new client connection\n");
@@ -134,6 +128,29 @@ void handle_client_connections(int *server_fd) {
         // Create a new thread for each client
         if (pthread_create(&thread_id, NULL, handle_client, (void *)&new_socket) != 0) {
             perror("Failed to create client thread");
+            close(new_socket);
+        }
+    }
+}
+
+void *admin_listener(void *arg) {
+    int admin_fd = *(int *)arg;
+    int new_socket;
+    struct sockaddr_in address;
+    int addrlen = sizeof(address);
+    pthread_t thread_id;
+
+    while (1) {
+        if ((new_socket = accept(admin_fd, (struct sockaddr *)&address, (socklen_t*)&addrlen)) < 0) {
+            perror("Admin accept failed");
+            continue;
+        }
+
+        printf("Accepted new admin connection\n");
+
+        // Create a new thread for each admin client
+        if (pthread_create(&thread_id, NULL, handle_admin_client, (void *)&new_socket) != 0) {
+            perror("Failed to create admin thread");
             close(new_socket);
         }
     }
