@@ -3,37 +3,32 @@
 #include <string.h>
 #include <unistd.h>
 #include <arpa/inet.h>
+#include <dirent.h>
+#include <sys/stat.h>
 
 #define PORT 8080
 #define BUFFER_SIZE 1024
 
+void send_directory(int sock, const char *source_dir, const char *dest_file, int compression_level);
+
 int main() {
     int sock = 0;
     struct sockaddr_in serv_addr;
-    char buffer[BUFFER_SIZE] = {0};
-    char source[BUFFER_SIZE];
+    char source_dir[BUFFER_SIZE];
     char destination[BUFFER_SIZE];
-    int compression_level;
     char dest_file[BUFFER_SIZE];
+    int compression_level;
 
-    // Get file paths and compression level from the user
-    printf("Enter source file path: ");
-    scanf("%s", source);
-    printf("Enter destination directory: ");
+    // Get directory path and compression level from the user
+    printf("Enter source directory path: ");
+    scanf("%s", source_dir);
+    printf("Enter destination file path (including filename): ");
     scanf("%s", destination);
     printf("Enter compression level (0-9): ");
     scanf("%d", &compression_level);
 
-    // Extract filename from source path
-    char *filename = strrchr(source, '/');
-    if (filename == NULL) {
-        filename = source;
-    } else {
-        filename++;  // Skip the '/'
-    }
-
     // Construct the full destination file path
-    snprintf(dest_file, BUFFER_SIZE, "%s/%s.gz", destination, filename);
+    snprintf(dest_file, BUFFER_SIZE, "%s.gz", destination);
 
     // Create socket
     if ((sock = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
@@ -56,14 +51,20 @@ int main() {
         return -1;
     }
 
-    // Send file paths and compression level to the server
-    snprintf(buffer, BUFFER_SIZE, "%s %s %d", source, dest_file, compression_level);
-    send(sock, buffer, strlen(buffer), 0);
+    // Send directory path, destination file path, and compression level to the server
+    send_directory(sock, source_dir, dest_file, compression_level);
 
     // Receive server response
+    char buffer[BUFFER_SIZE] = {0};
     read(sock, buffer, BUFFER_SIZE);
     printf("Server: %s\n", buffer);
 
     close(sock);
     return 0;
+}
+
+void send_directory(int sock, const char *source_dir, const char *dest_file, int compression_level) {
+    char buffer[BUFFER_SIZE];
+    snprintf(buffer, BUFFER_SIZE, "%s %s %d", source_dir, dest_file, compression_level);
+    send(sock, buffer, strlen(buffer), 0);
 }

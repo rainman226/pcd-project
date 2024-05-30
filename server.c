@@ -6,12 +6,16 @@
 #include <sys/socket.h>
 #include <pthread.h>
 #include <zlib.h>
+#include <dirent.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <libtar.h>
 
 #define PORT 8080
-#define BUFFER_SIZE 1024
-#define CHUNK 16384
+#define BUFFER_SIZE 4096  // Increased buffer size to avoid truncation warnings
 
 void *handle_client(void *client_socket);
+int create_tar(const char *source_dir, const char *tar_path);
 int compress_file(const char *source, const char *destination, int level);
 
 int main() {
@@ -69,25 +73,81 @@ int main() {
 void *handle_client(void *client_socket) {
     int sock = *(int *)client_socket;
     char buffer[BUFFER_SIZE] = {0};
-    char source[BUFFER_SIZE];
+    char source_dir[BUFFER_SIZE];
     char destination[BUFFER_SIZE];
     int compression_level;
 
-    // Read the source file path, destination file path, and compression level from client
+    // Read the source directory path, destination file path, and compression level from client
     read(sock, buffer, BUFFER_SIZE);
-    sscanf(buffer, "%s %s %d", source, destination, &compression_level);
+    sscanf(buffer, "%s %s %d", source_dir, destination, &compression_level);
 
-    printf("Compressing file: %s\n", source);
+    printf("Compressing directory: %s\n", source_dir);
 
-    // Perform the file compression
-    if (compress_file(source, destination, compression_level) == 0) {
-        send(sock, "File compressed successfully", strlen("File compressed successfully"), 0);
-    } else {
-        send(sock, "File compression failed", strlen("File compression failed"), 0);
+    // Create a tarball of the directory
+    char tar_path[BUFFER_SIZE];
+    snprintf(tar_path, BUFFER_SIZE, "%s.tar", destination);
+    if (create_tar(source_dir, tar_path) != 0) {
+        send(sock, "Directory compression failed", strlen("Directory compression failed"), 0);
+        close(sock);
+        pthread_exit(NULL);
     }
+
+    // Compress the tarball with gzip
+    if (compress_file(tar_path, destination, compression_level) != 0) {
+        send(sock, "Directory compression failed", strlen("Directory compression failed"), 0);
+    } else {
+        send(sock, "Directory compressed successfully", strlen("Directory compressed successfully"), 0);
+    }
+
+    // Remove the tarball after compression
+    remove(tar_path);
 
     close(sock);
     pthread_exit(NULL);
+}
+
+int create_tar(const char *source_dir, const char *tar_path) {
+    TAR *pTar;
+    if (tar_open(&pTar, tar_path, NULL, O_WRONLY | O_CREAT, 0644, TAR_GNU) == -1) {
+        perror("tar_open");
+        return -1;
+    }
+
+    DIR *dir;
+    struct dirent *entry;
+    char filepath[BUFFER_SIZE];
+
+    if ((dir = opendir(source_dir)) == NULL) {
+        perror("opendir");
+        return -1;
+    }
+
+    while ((entry = readdir(dir)) != NULL) {
+        if (entry->d_type == DT_REG) {  // Only process regular files
+            snprintf(filepath, BUFFER_SIZE, "%s/%s", source_dir, entry->d_name);
+            if (tar_append_file(pTar, filepath, entry->d_name) != 0) {
+                perror("tar_append_file");
+                closedir(dir);
+                tar_close(pTar);
+                return -1;
+            }
+        }
+    }
+
+    closedir(dir);
+
+    if (tar_append_eof(pTar) != 0) {
+        perror("tar_append_eof");
+        tar_close(pTar);
+        return -1;
+    }
+
+    if (tar_close(pTar) != 0) {
+        perror("tar_close");
+        return -1;
+    }
+
+    return 0;
 }
 
 int compress_file(const char *source, const char *destination, int level) {
@@ -111,42 +171,19 @@ int compress_file(const char *source, const char *destination, int level) {
         return -1;
     }
 
-    fseek(src, 0, SEEK_END);
-    size_t total_size = ftell(src);
-    fseek(src, 0, SEEK_SET);
-
-    unsigned char buffer[CHUNK];
-    int num_read = 0;
-    size_t total_read = 0;
-
-    while ((num_read = fread(buffer, 1, CHUNK, src)) > 0) {
+    unsigned char buffer[BUFFER_SIZE];
+    int num_read;
+    while ((num_read = fread(buffer, 1, BUFFER_SIZE, src)) > 0) {
         if (gzwrite(dst, buffer, num_read) != num_read) {
             perror("Failed to write to gzip file");
             fclose(src);
             gzclose(dst);
             return -1;
         }
-        total_read += num_read;
-        print_progress(total_read, total_size);
     }
 
     fclose(src);
     gzclose(dst);
 
     return 0;
-}
-
-void print_progress(size_t current, size_t total) {
-    int bar_width = 70;
-    float progress = (float)current / total;
-    int pos = bar_width * progress;
-
-    printf("[");
-    for (int i = 0; i < bar_width; ++i) {
-        if (i < pos) printf("=");
-        else if (i == pos) printf(">");
-        else printf(" ");
-    }
-    printf("] %d%%\r", (int)(progress * 100.0));
-    fflush(stdout);
 }
