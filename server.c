@@ -11,64 +11,132 @@
 #include <time.h>
 
 #define PORT 8080
+#define ADMIN_PORT 8081
 #define BUFFER_SIZE 4096
+#define MAX_COMPRESSIONS 100
+
+typedef struct {
+    int active;
+    char source_dir[BUFFER_SIZE];
+    char destination[BUFFER_SIZE];
+    int compression_level;
+    char password[BUFFER_SIZE];
+    size_t total_size;
+    size_t total_read;
+} compression_info_t;
+
+compression_info_t compressions[MAX_COMPRESSIONS];
+pthread_mutex_t compressions_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 void *handle_client(void *client_socket);
-int add_file_to_zip(zipFile zf, const char *filepath, const char *password, int compression_level);
-int create_zip(const char *source_dir, const char *zip_path, const char *password, int compression_level);
+void *handle_admin_client(void *client_socket);
+int add_file_to_zip(zipFile zf, const char *filepath, const char *password, int compression_level, compression_info_t *info);
+int create_zip(const char *source_dir, const char *zip_path, const char *password, int compression_level, compression_info_t *info);
 uLong tm_to_dosdate(const struct tm *ptm);
 void print_progress(size_t current, size_t total);
 
 int main() {
-    int server_fd, new_socket;
+    int server_fd, admin_fd, new_socket;
     struct sockaddr_in address;
     int addrlen = sizeof(address);
-    pthread_t thread_id;
+    pthread_t thread_id, admin_thread_id;
 
-    // Creating socket file descriptor
+    memset(compressions, 0, sizeof(compressions));
+
+    // Creating socket file descriptor for clients
     if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) == 0) {
-        perror("Socket failed");
+        perror("Client socket failed");
         exit(EXIT_FAILURE);
     }
 
-    // Bind the socket to the network
+    // Creating socket file descriptor for admin clients
+    if ((admin_fd = socket(AF_INET, SOCK_STREAM, 0)) == 0) {
+        perror("Admin socket failed");
+        exit(EXIT_FAILURE);
+    }
+
+    // Bind the client socket to the network
     address.sin_family = AF_INET;
     address.sin_addr.s_addr = INADDR_ANY;
     address.sin_port = htons(PORT);
 
     if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
-        perror("Bind failed");
+        perror("Client bind failed");
         close(server_fd);
         exit(EXIT_FAILURE);
     }
 
-    // Start listening for incoming connections
+    // Bind the admin socket to the network
+    address.sin_port = htons(ADMIN_PORT);
+
+    if (bind(admin_fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
+        perror("Admin bind failed");
+        close(admin_fd);
+        exit(EXIT_FAILURE);
+    }
+
+    // Start listening for incoming client connections
     if (listen(server_fd, 3) < 0) {
-        perror("Listen failed");
+        perror("Client listen failed");
         close(server_fd);
         exit(EXIT_FAILURE);
     }
 
-    printf("Server is listening on port %d\n", PORT);
+    // Start listening for incoming admin connections
+    if (listen(admin_fd, 3) < 0) {
+        perror("Admin listen failed");
+        close(admin_fd);
+        exit(EXIT_FAILURE);
+    }
 
+    printf("Server is listening on port %d for clients and port %d for admins\n", PORT, ADMIN_PORT);
+
+    // Handling client connections in a separate thread
+    pthread_create(&thread_id, NULL, (void *(*)(void *))handle_client_connections, (void *)&server_fd);
+
+    // Handling admin connections
     while (1) {
-        if ((new_socket = accept(server_fd, (struct sockaddr *)&address, (socklen_t*)&addrlen)) < 0) {
-            perror("Accept failed");
-            close(server_fd);
+        if ((new_socket = accept(admin_fd, (struct sockaddr *)&address, (socklen_t*)&addrlen)) < 0) {
+            perror("Admin accept failed");
+            close(admin_fd);
             exit(EXIT_FAILURE);
         }
 
-        printf("Accepted new connection\n");
+        printf("Accepted new admin connection\n");
 
-        // Create a new thread for each client
-        if (pthread_create(&thread_id, NULL, handle_client, (void *)&new_socket) != 0) {
-            perror("Failed to create thread");
+        // Create a new thread for each admin client
+        if (pthread_create(&admin_thread_id, NULL, handle_admin_client, (void *)&new_socket) != 0) {
+            perror("Failed to create admin thread");
             close(new_socket);
         }
     }
 
     close(server_fd);
+    close(admin_fd);
     return 0;
+}
+
+void handle_client_connections(int *server_fd) {
+    int new_socket;
+    struct sockaddr_in address;
+    int addrlen = sizeof(address);
+    pthread_t thread_id;
+
+    while (1) {
+        if ((new_socket = accept(*server_fd, (struct sockaddr *)&address, (socklen_t*)&addrlen)) < 0) {
+            perror("Client accept failed");
+            close(*server_fd);
+            exit(EXIT_FAILURE);
+        }
+
+        printf("Accepted new client connection\n");
+
+        // Create a new thread for each client
+        if (pthread_create(&thread_id, NULL, handle_client, (void *)&new_socket) != 0) {
+            perror("Failed to create client thread");
+            close(new_socket);
+        }
+    }
 }
 
 void *handle_client(void *client_socket) {
@@ -78,6 +146,7 @@ void *handle_client(void *client_socket) {
     char destination[BUFFER_SIZE];
     int compression_level;
     char password[BUFFER_SIZE];
+    int i;
 
     // Read the source directory path, destination file path, compression level, and password from client
     read(sock, buffer, BUFFER_SIZE);
@@ -90,18 +159,67 @@ void *handle_client(void *client_socket) {
 
     printf("Compressing directory: %s\n", source_dir);
 
+    pthread_mutex_lock(&compressions_mutex);
+    for (i = 0; i < MAX_COMPRESSIONS; i++) {
+        if (!compressions[i].active) {
+            compressions[i].active = 1;
+            strncpy(compressions[i].source_dir, source_dir, BUFFER_SIZE);
+            strncpy(compressions[i].destination, destination, BUFFER_SIZE);
+            compressions[i].compression_level = compression_level;
+            strncpy(compressions[i].password, password, BUFFER_SIZE);
+            compressions[i].total_size = 0;
+            compressions[i].total_read = 0;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&compressions_mutex);
+
+    if (i == MAX_COMPRESSIONS) {
+        send(sock, "Server is busy, try again later", strlen("Server is busy, try again later"), 0);
+        close(sock);
+        pthread_exit(NULL);
+    }
+
     // Create a ZIP archive of the directory
-    if (create_zip(source_dir, destination, password, compression_level) != 0) {
+    if (create_zip(source_dir, destination, password, compression_level, &compressions[i]) != 0) {
         send(sock, "Directory compression failed", strlen("Directory compression failed"), 0);
     } else {
         send(sock, "Directory compressed successfully", strlen("Directory compressed successfully"), 0);
     }
 
+    pthread_mutex_lock(&compressions_mutex);
+    compressions[i].active = 0;
+    pthread_mutex_unlock(&compressions_mutex);
+
     close(sock);
     pthread_exit(NULL);
 }
 
-int create_zip(const char *source_dir, const char *zip_path, const char *password, int compression_level) {
+void *handle_admin_client(void *client_socket) {
+    int sock = *(int *)client_socket;
+    char buffer[BUFFER_SIZE] = {0};
+
+    printf("Handling admin client\n");
+
+    pthread_mutex_lock(&compressions_mutex);
+    for (int i = 0; i < MAX_COMPRESSIONS; i++) {
+        if (compressions[i].active) {
+            snprintf(buffer, BUFFER_SIZE, "Source: %s, Destination: %s, Level: %d, Progress: %zu/%zu\n",
+                     compressions[i].source_dir, compressions[i].destination, compressions[i].compression_level,
+                     compressions[i].total_read, compressions[i].total_size);
+            printf("Sending: %s", buffer);
+            send(sock, buffer, strlen(buffer), 0);
+            memset(buffer, 0, BUFFER_SIZE);  // Clear buffer after sending
+        }
+    }
+    pthread_mutex_unlock(&compressions_mutex);
+
+    close(sock);
+    printf("Admin client handled and closed\n");
+    pthread_exit(NULL);
+}
+
+int create_zip(const char *source_dir, const char *zip_path, const char *password, int compression_level, compression_info_t *info) {
     zipFile zf = zipOpen(zip_path, APPEND_STATUS_CREATE);
     if (zf == NULL) {
         perror("zipOpen");
@@ -121,7 +239,7 @@ int create_zip(const char *source_dir, const char *zip_path, const char *passwor
         if (entry->d_type == DT_REG) {  // Only process regular files
             snprintf(filepath, BUFFER_SIZE, "%s/%s", source_dir, entry->d_name);
             printf("Adding file: %s with password: '%s'\n", filepath, password);
-            if (add_file_to_zip(zf, filepath, password, compression_level) != 0) {
+            if (add_file_to_zip(zf, filepath, password, compression_level, info) != 0) {
                 closedir(dir);
                 zipClose(zf, NULL);
                 return -1;
@@ -134,7 +252,7 @@ int create_zip(const char *source_dir, const char *zip_path, const char *passwor
     return 0;
 }
 
-int add_file_to_zip(zipFile zf, const char *filepath, const char *password, int compression_level) {
+int add_file_to_zip(zipFile zf, const char *filepath, const char *password, int compression_level, compression_info_t *info) {
     FILE *file = fopen(filepath, "rb");
     if (!file) {
         perror("fopen");
@@ -174,6 +292,10 @@ int add_file_to_zip(zipFile zf, const char *filepath, const char *password, int 
     size_t total_read = 0;
     size_t total_size = st.st_size;
 
+    pthread_mutex_lock(&compressions_mutex);
+    info->total_size += total_size;
+    pthread_mutex_unlock(&compressions_mutex);
+
     while ((bytes_read = fread(buffer, 1, BUFFER_SIZE, file)) > 0) {
         err = zipWriteInFileInZip(zf, buffer, bytes_read);
         if (err < 0) {
@@ -182,7 +304,12 @@ int add_file_to_zip(zipFile zf, const char *filepath, const char *password, int 
             return -1;
         }
         total_read += bytes_read;
-        print_progress(total_read, total_size);
+
+        pthread_mutex_lock(&compressions_mutex);
+        info->total_read += bytes_read;
+        pthread_mutex_unlock(&compressions_mutex);
+
+        print_progress(info->total_read, info->total_size);
     }
 
     fclose(file);
