@@ -17,6 +17,7 @@ void *handle_client(void *client_socket);
 int add_file_to_zip(zipFile zf, const char *filepath, const char *password, int compression_level);
 int create_zip(const char *source_dir, const char *zip_path, const char *password, int compression_level);
 uLong tm_to_dosdate(const struct tm *ptm);
+void print_progress(size_t current, size_t total);
 
 int main() {
     int server_fd, new_socket;
@@ -82,7 +83,11 @@ void *handle_client(void *client_socket) {
     read(sock, buffer, BUFFER_SIZE);
     sscanf(buffer, "%s %s %d %[^\n]", source_dir, destination, &compression_level, password);
 
-    printf("Password: %s\n", password);
+    // Ensure the password is properly null-terminated
+    password[strcspn(password, "\n")] = '\0';
+
+    printf("Password: '%s'\n", password); // Using quotes to see if there are any trailing spaces
+
     printf("Compressing directory: %s\n", source_dir);
 
     // Create a ZIP archive of the directory
@@ -115,7 +120,7 @@ int create_zip(const char *source_dir, const char *zip_path, const char *passwor
     while ((entry = readdir(dir)) != NULL) {
         if (entry->d_type == DT_REG) {  // Only process regular files
             snprintf(filepath, BUFFER_SIZE, "%s/%s", source_dir, entry->d_name);
-            printf("Adding file: %s with password: %s\n", filepath, password);
+            printf("Adding file: %s with password: '%s'\n", filepath, password);
             if (add_file_to_zip(zf, filepath, password, compression_level) != 0) {
                 closedir(dir);
                 zipClose(zf, NULL);
@@ -166,6 +171,9 @@ int add_file_to_zip(zipFile zf, const char *filepath, const char *password, int 
 
     unsigned char buffer[BUFFER_SIZE];
     size_t bytes_read;
+    size_t total_read = 0;
+    size_t total_size = st.st_size;
+
     while ((bytes_read = fread(buffer, 1, BUFFER_SIZE, file)) > 0) {
         err = zipWriteInFileInZip(zf, buffer, bytes_read);
         if (err < 0) {
@@ -173,11 +181,28 @@ int add_file_to_zip(zipFile zf, const char *filepath, const char *password, int 
             fprintf(stderr, "zipWriteInFileInZip error: %d\n", err);
             return -1;
         }
+        total_read += bytes_read;
+        print_progress(total_read, total_size);
     }
 
     fclose(file);
     zipCloseFileInZip(zf);
     return 0;
+}
+
+void print_progress(size_t current, size_t total) {
+    int bar_width = 70;
+    float progress = (float)current / total;
+    int pos = bar_width * progress;
+
+    printf("[");
+    for (int i = 0; i < bar_width; ++i) {
+        if (i < pos) printf("=");
+        else if (i == pos) printf(">");
+        else printf(" ");
+    }
+    printf("] %d%%\r", (int)(progress * 100.0));
+    fflush(stdout);
 }
 
 uLong tm_to_dosdate(const struct tm *ptm) {
