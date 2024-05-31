@@ -1,20 +1,21 @@
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
-#include <arpa/inet.h>
-#include <sys/socket.h>
-#include <pthread.h>
-#include <minizip/zip.h>
-#include <dirent.h>
-#include <sys/stat.h>
-#include <time.h>
+#include <stdio.h>          // for printf(), perror()
+#include <stdlib.h>         // for exit(), malloc(), free()
+#include <string.h>         // for memset(), strlen(), strchr(), strrchr()
+#include <unistd.h>         // for close(), read(), write()
+#include <arpa/inet.h>      // for sockaddr_in, AF_INET, SOCK_STREAM, INADDR_ANY, htons(), bind(), listen(), accept()
+#include <sys/socket.h>     // for socket(), connect(), send(), recv()
+#include <pthread.h>        // for pthread_create(), pthread_join()
+#include <minizip/zip.h>    // for zipFile, zipOpen(), zipOpenNewFileInZip3(), zipWriteInFileInZip(), zipClose(), ZIP_OK
+#include <dirent.h>         // for opendir(), readdir(), closedir()
+#include <sys/stat.h>       // for stat(), struct stat
+#include <time.h>           // for struct tm, localtime()
 
-#define PORT 8080
-#define ADMIN_PORT 8081
-#define BUFFER_SIZE 4096
+#define PORT 8080               // port number
+#define ADMIN_PORT 8081         // admin port number
+#define BUFFER_SIZE 4096        // buffer size
 #define MAX_COMPRESSIONS 100
 
+// struct to store information about a compression
 typedef struct {
     int active;
     char source_dir[BUFFER_SIZE];
@@ -25,8 +26,8 @@ typedef struct {
     size_t total_read;
 } compression_info_t;
 
-compression_info_t compressions[MAX_COMPRESSIONS];
-pthread_mutex_t compressions_mutex = PTHREAD_MUTEX_INITIALIZER;
+compression_info_t compressions[MAX_COMPRESSIONS];  // array to store compression information               
+pthread_mutex_t compressions_mutex = PTHREAD_MUTEX_INITIALIZER;     // mutex to protect the compressions array
 
 void *handle_client(void *client_socket);
 void *handle_admin_client(void *client_socket);
@@ -41,21 +42,21 @@ int main() {
     int server_fd, admin_fd;
     pthread_t client_thread, admin_thread;
 
-    memset(compressions, 0, sizeof(compressions));
+    memset(compressions, 0, sizeof(compressions));              // Initialize compressions array        
 
-    // Creating socket file descriptor for clients
+    // creating socket file descriptor for clients
     if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) == 0) {
         perror("Client socket failed");
         exit(EXIT_FAILURE);
     }
 
-    // Creating socket file descriptor for admin clients
+    // creating socket file descriptor for admin clients
     if ((admin_fd = socket(AF_INET, SOCK_STREAM, 0)) == 0) {
         perror("Admin socket failed");
         exit(EXIT_FAILURE);
     }
 
-    // Bind the client socket to the network
+    // bind the client socket to the network
     struct sockaddr_in client_address = {
         .sin_family = AF_INET,
         .sin_addr.s_addr = INADDR_ANY,
@@ -110,6 +111,7 @@ int main() {
     return 0;
 }
 
+// Function to handle client connections
 void *client_listener(void *arg) {
     int server_fd = *(int *)arg;
     int new_socket;
@@ -133,6 +135,8 @@ void *client_listener(void *arg) {
     }
 }
 
+
+// Function to handle admin connections
 void *admin_listener(void *arg) {
     int admin_fd = *(int *)arg;
     int new_socket;
@@ -141,7 +145,7 @@ void *admin_listener(void *arg) {
     pthread_t thread_id;
 
     while (1) {
-        if ((new_socket = accept(admin_fd, (struct sockaddr *)&address, (socklen_t*)&addrlen)) < 0) {
+        if ((new_socket = accept(admin_fd, (struct sockaddr *)&address, (socklen_t*)&addrlen)) < 0) {       // accept connection from client
             perror("Admin accept failed");
             continue;
         }
@@ -156,6 +160,7 @@ void *admin_listener(void *arg) {
     }
 }
 
+// Function to handle client connections
 void *handle_client(void *client_socket) {
     int sock = *(int *)client_socket;
     char buffer[BUFFER_SIZE] = {0};
@@ -169,14 +174,16 @@ void *handle_client(void *client_socket) {
     read(sock, buffer, BUFFER_SIZE);
     sscanf(buffer, "%s %s %d %[^\n]", source_dir, destination, &compression_level, password);
 
-    // Ensure the password is properly null-terminated
+    // we delete anything unwanted
     password[strcspn(password, "\n")] = '\0';
 
-    printf("Password: '%s'\n", password); // Using quotes to see if there are any trailing spaces
+    printf("Password: '%s'\n", password); // verificare
 
     printf("Compressing directory: %s\n", source_dir);
 
-    pthread_mutex_lock(&compressions_mutex);
+    pthread_mutex_lock(&compressions_mutex);            // Lock the mutex to protect the compressions array
+
+    // Find an empty slot in the compressions array
     for (i = 0; i < MAX_COMPRESSIONS; i++) {
         if (!compressions[i].active) {
             compressions[i].active = 1;
@@ -189,15 +196,16 @@ void *handle_client(void *client_socket) {
             break;
         }
     }
-    pthread_mutex_unlock(&compressions_mutex);
+    pthread_mutex_unlock(&compressions_mutex);      // Unlock the mutex
 
+    // check if there are too many compressions
     if (i == MAX_COMPRESSIONS) {
         send(sock, "Server is busy, try again later", strlen("Server is busy, try again later"), 0);
         close(sock);
         pthread_exit(NULL);
     }
 
-    // Create a ZIP archive of the directory
+    // create a ZIP archive of the directory
     if (create_zip(source_dir, destination, password, compression_level, &compressions[i]) != 0) {
         send(sock, "Directory compression failed", strlen("Directory compression failed"), 0);
     } else {
@@ -212,13 +220,16 @@ void *handle_client(void *client_socket) {
     pthread_exit(NULL);
 }
 
+// function to handle admin connections
 void *handle_admin_client(void *client_socket) {
     int sock = *(int *)client_socket;
     char buffer[BUFFER_SIZE] = {0};
 
     printf("Handling admin client\n");
 
-    pthread_mutex_lock(&compressions_mutex);
+    pthread_mutex_lock(&compressions_mutex);                    // Lock the mutex to protect the compressions array
+
+    // Send information about each active compression to the admin client
     for (int i = 0; i < MAX_COMPRESSIONS; i++) {
         if (compressions[i].active) {
             snprintf(buffer, BUFFER_SIZE, "Source: %s, Destination: %s, Level: %d, Progress: %zu/%zu\n",
@@ -236,8 +247,11 @@ void *handle_admin_client(void *client_socket) {
     pthread_exit(NULL);
 }
 
+// Function to create a ZIP archive of a directory
 int create_zip(const char *source_dir, const char *zip_path, const char *password, int compression_level, compression_info_t *info) {
-    zipFile zf = zipOpen(zip_path, APPEND_STATUS_CREATE);
+    zipFile zf = zipOpen(zip_path, APPEND_STATUS_CREATE);   // Open a ZIP archive for writing 
+    
+    // check if the ZIP archive was opened successfully
     if (zf == NULL) {
         perror("zipOpen");
         return -1;
@@ -247,15 +261,19 @@ int create_zip(const char *source_dir, const char *zip_path, const char *passwor
     struct dirent *entry;
     char filepath[BUFFER_SIZE];
 
+    // open the source directory
     if ((dir = opendir(source_dir)) == NULL) {
         perror("opendir");
         return -1;
     }
 
+    // iterate over each file in the directory
     while ((entry = readdir(dir)) != NULL) {
-        if (entry->d_type == DT_REG) {  // Only process regular files
+        if (entry->d_type == DT_REG) {  // only process regular files
             snprintf(filepath, BUFFER_SIZE, "%s/%s", source_dir, entry->d_name);
             printf("Adding file: %s with password: '%s'\n", filepath, password);
+
+            // add the file to the ZIP archive
             if (add_file_to_zip(zf, filepath, password, compression_level, info) != 0) {
                 closedir(dir);
                 zipClose(zf, NULL);
@@ -269,15 +287,16 @@ int create_zip(const char *source_dir, const char *zip_path, const char *passwor
     return 0;
 }
 
+// Function to add a file to a ZIP archive
 int add_file_to_zip(zipFile zf, const char *filepath, const char *password, int compression_level, compression_info_t *info) {
-    FILE *file = fopen(filepath, "rb");
+    FILE *file = fopen(filepath, "rb");     // open the file for reading
     if (!file) {
         perror("fopen");
         return -1;
     }
 
-    zip_fileinfo zi;
-    memset(&zi, 0, sizeof(zi));
+    zip_fileinfo zi;            // ZIP file information
+    memset(&zi, 0, sizeof(zi)); // clear the ZIP file information
 
     // Get file modification time
     struct stat st;
@@ -286,24 +305,26 @@ int add_file_to_zip(zipFile zf, const char *filepath, const char *password, int 
         zi.dosDate = tm_to_dosdate(filedate);
     }
 
-    const char *filename_in_zip = strrchr(filepath, '/');
+    const char *filename_in_zip = strrchr(filepath, '/');   // get the filename from the path
     if (filename_in_zip == NULL) {
         filename_in_zip = filepath;
     } else {
         filename_in_zip++;
     }
 
-    int err = zipOpenNewFileInZip3(
+    int err = zipOpenNewFileInZip3(                                 // open a new file in the ZIP archive
         zf, filename_in_zip, &zi, NULL, 0, NULL, 0, NULL,
         Z_DEFLATED, compression_level, 0,
         -MAX_WBITS, DEF_MEM_LEVEL, Z_DEFAULT_STRATEGY,
         (password && strlen(password) > 0) ? password : NULL, 0);
+    // check if the file was opened successfully
     if (err != ZIP_OK) {
         fclose(file);
         fprintf(stderr, "zipOpenNewFileInZip3 error: %d\n", err);
         return -1;
     }
 
+    // read the file in chunks and write it to the ZIP archive
     unsigned char buffer[BUFFER_SIZE];
     size_t bytes_read;
     size_t total_read = 0;
@@ -313,14 +334,14 @@ int add_file_to_zip(zipFile zf, const char *filepath, const char *password, int 
     info->total_size += total_size;
     pthread_mutex_unlock(&compressions_mutex);
 
-    while ((bytes_read = fread(buffer, 1, BUFFER_SIZE, file)) > 0) {
-        err = zipWriteInFileInZip(zf, buffer, bytes_read);
+    while ((bytes_read = fread(buffer, 1, BUFFER_SIZE, file)) > 0) {        // read the file in chunks
+        err = zipWriteInFileInZip(zf, buffer, bytes_read);                  // write the file to the ZIP archive
         if (err < 0) {
             fclose(file);
             fprintf(stderr, "zipWriteInFileInZip error: %d\n", err);
             return -1;
         }
-        total_read += bytes_read;
+        total_read += bytes_read;       // update the total read size
 
         pthread_mutex_lock(&compressions_mutex);
         info->total_read += bytes_read;
@@ -334,6 +355,7 @@ int add_file_to_zip(zipFile zf, const char *filepath, const char *password, int 
     return 0;
 }
 
+// function to print a progress bar
 void print_progress(size_t current, size_t total) {
     int bar_width = 70;
     float progress = (float)current / total;
@@ -349,6 +371,7 @@ void print_progress(size_t current, size_t total) {
     fflush(stdout);
 }
 
+// function to convert a tm struct to a DOS date
 uLong tm_to_dosdate(const struct tm *ptm) {
     uLong year = (uLong)ptm->tm_year + 1900;
     if (year < 1980) {
